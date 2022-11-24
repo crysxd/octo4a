@@ -4,7 +4,10 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.hardware.camera2.CameraMetadata
@@ -43,6 +46,7 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     private val cameraEnumerationRepository: CameraEnumerationRepository by inject()
     private val captureExecutor by lazy { Executors.newCachedThreadPool() }
     private val nativeUtils by lazy { NativeCameraUtils() }
+    val rotation get() = cameraSettings.imageRotation?.toIntOrNull() ?: 0
     var currentCamera: Camera? = null
 
     var fpsLimit = -1
@@ -110,9 +114,24 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
                     override fun onCaptureSuccess(image: ImageProxy) {
                         val buffer = image.planes[0].buffer
                         val bytes = ByteArray(buffer.capacity()).also { array -> buffer.get(array) }
+                        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                        val original = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        val rotated = Bitmap.createBitmap(
+                            original,
+                            0,
+                            0,
+                            original.width,
+                            original.height,
+                            matrix,
+                            true
+                        )
+                        val out = ByteArrayOutputStream()
+                        rotated.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                        val rotatedBytes = out.toByteArray()
+
                         super.onCaptureSuccess(image) //Closes the image
                         image.close()
-                        it.resume(bytes)
+                        it.resume(rotatedBytes)
                     }
 
                     override fun onError(exception: ImageCaptureException) {
@@ -132,7 +151,7 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
 
         val turnFlashOn = cameraSettings.flashWhenObserved
 
-        if (listenerCount > 0  && turnFlashOn && cameraInitialized) {
+        if (listenerCount > 0 && turnFlashOn && cameraInitialized) {
             currentCamera?.cameraControl?.enableTorch(true)
         }
     }
@@ -213,16 +232,12 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
         cameraEnumerationRepository.enumerateCameras()
         // check if the device has any cameras at all
         // some TV boxes have no cameras at all, and it causes cameraSelector to throw an exception
-        if(cameraEnumerationRepository.enumeratedCameras.value?.isEmpty() != false) {
+        if (cameraEnumerationRepository.enumeratedCameras.value?.isEmpty() != false) {
             return
         }
 
-
-
         val cameraProviderFuture = ProcessCameraProvider.getInstance(applicationContext)
         val out = ByteArrayOutputStream()
-
-        val rotation = cameraSettings.imageRotation?.toIntOrNull() ?: 0
 
         cameraProviderFuture.addListener({
             cameraProcessProvider = cameraProviderFuture.get()
@@ -243,7 +258,10 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
                     if (listenerCount > 0 || latestFrame.isEmpty()) {
                         val isI420 = (image.planes[1].pixelStride == 1)
 
-                        var nv21: ByteArray = if (isI420) nativeUtils.yuvToNv21Slow(image) else nativeUtils.toNv21(image)!!
+                        var nv21: ByteArray =
+                            if (isI420) nativeUtils.yuvToNv21Slow(image) else nativeUtils.toNv21(
+                                image
+                            )!!
 
                         var realWidth = image.width
                         var realHeight = image.height
